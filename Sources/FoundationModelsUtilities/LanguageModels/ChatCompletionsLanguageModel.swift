@@ -632,7 +632,9 @@ private struct ChatCompletionsClient {
   }
 
   private func buildURLRequest(for request: ChatCompletionRequest) throws -> URLRequest {
-    let isVersioned = baseURL.pathComponents.contains("v1")
+    let isVersioned = baseURL.pathComponents.contains { component in
+      component.wholeMatch(of: #/v\d+/#) != nil
+    }
     let endpoint = isVersioned ? "/chat/completions" : "/v1/chat/completions"
     let url = baseURL.appendingPathComponent(endpoint)
     var urlRequest = URLRequest(url: url)
