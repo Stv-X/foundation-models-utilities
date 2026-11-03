@@ -195,6 +195,14 @@ public struct ResponsesLanguageModel: Sendable, LanguageModel {
     public typealias Model = ResponsesLanguageModel
     private let configuration: Configuration
 
+    /// In-flight bookkeeping for a function call seen in the stream.
+    struct PendingFunctionCall {
+      var callId: String?
+      var name: String?
+      var accumulatedArguments = ""
+      var registered = false
+    }
+
     public init(configuration: Configuration) {
       self.configuration = configuration
     }
@@ -286,12 +294,23 @@ public struct ResponsesLanguageModel: Sendable, LanguageModel {
       _ events: EventSequence,
       into channel: LanguageModelExecutorGenerationChannel
     ) async throws where EventSequence.Element == ResponsesClient.StreamEvent {
-      // Latched (call_id, name) per output_index for function calls. The
-      // `response.output_item.added` event supplies them; argument deltas
-      // arrive later keyed by `output_index`. `registered` tracks whether we
-      // have already forwarded any `.toolCall` event for this call, so a
-      // no-argument call can still be registered on `output_item.done`.
-      var functionCalls: [Int: (callId: String, name: String, registered: Bool)] = [:]
+      // Bookkeeping for function calls. Events correlate a call by
+      // `output_index` and/or `item_id` - servers vary in which they
+      // supply, so a record is created on first sight and aliased under
+      // both identifiers. `registered` tracks whether any `.toolCall` has
+      // been forwarded yet; `accumulatedArguments` tracks what the framework
+      // has seen, so terminal events carrying authoritative arguments can
+      // register calls that never streamed deltas and repair truncated ones.
+      var functionCalls: [String: PendingFunctionCall] = [:]
+      var keyByOutputIndex: [Int: String] = [:]
+      var keyByItemID: [String: String] = [:]
+
+      // Item keys whose text/refusal/reasoning deltas were already streamed,
+      // so terminal `done` events are skipped when redundant and used as a
+      // fallback when they are the only payload a server sends.
+      var streamedTextKeys = Set<String>()
+      var streamedRefusalKeys = Set<String>()
+      var streamedReasoningKeys = Set<String>()
 
       // Stable entryIDs per event type for the duration of this stream.
       // Without these, interleaved reasoning/response/toolCalls events would
@@ -301,14 +320,123 @@ public struct ResponsesLanguageModel: Sendable, LanguageModel {
       let reasoningEntryID = UUID().uuidString
       let toolCallsEntryID = UUID().uuidString
 
+      // Returns the bookkeeping key for a function-call event, creating a
+      // record (and aliases) when the event is the call's first sighting.
+      func callKey(outputIndex: Int?, itemID: String?) -> String? {
+        if let outputIndex, let key = keyByOutputIndex[outputIndex] {
+          return key
+        }
+        if let itemID, let key = keyByItemID[itemID] {
+          return key
+        }
+        guard outputIndex != nil || itemID != nil else { return nil }
+        let key = itemID ?? "output-index-\(outputIndex!)"
+        functionCalls[key] = PendingFunctionCall()
+        if let outputIndex { keyByOutputIndex[outputIndex] = key }
+        if let itemID { keyByItemID[itemID] = key }
+        return key
+      }
+
+      func registerFunctionCall(
+        key: String, callId: String, name: String, arguments: String
+      ) async {
+        await channel.send(
+          .toolCalls(
+            entryID: toolCallsEntryID,
+            action: .toolCall(
+              id: callId,
+              name: name,
+              action: .appendArguments(arguments, tokenCount: 1)
+            )
+          )
+        )
+        functionCalls[key]?.registered = true
+      }
+
+      // Applies authoritative terminal arguments for a call: registers it if
+      // deltas never streamed, and repairs streamed arguments that diverge
+      // from the authoritative payload (lost or truncated deltas) by
+      // replacing the tool call in the transcript.
+      func applyAuthoritativeArguments(key: String, _ authoritative: String) async {
+        guard var call = functionCalls[key] else { return }
+        let wasRegistered = call.registered
+        let streamedArguments = call.accumulatedArguments
+        call.accumulatedArguments = authoritative
+        functionCalls[key] = call
+        guard let callId = call.callId, let name = call.name else { return }
+        if !wasRegistered {
+          await registerFunctionCall(
+            key: key, callId: callId, name: name, arguments: authoritative
+          )
+        } else if streamedArguments != authoritative {
+          await channel.send(
+            .toolCalls(
+              entryID: toolCallsEntryID,
+              action: .removeToolCall(id: callId)
+            )
+          )
+          await channel.send(
+            .toolCalls(
+              entryID: toolCallsEntryID,
+              action: .toolCall(
+                id: callId,
+                name: name,
+                action: .appendArguments(authoritative, tokenCount: 1)
+              )
+            )
+          )
+        }
+      }
+
       for try await event in events {
         switch event.type {
         case "response.output_text.delta":
-          if let delta = event.delta {
+          if let delta = event.delta, !delta.isEmpty {
+            streamedTextKeys.insert(event.itemId ?? "")
             await channel.send(
               .response(
                 entryID: responseEntryID,
                 action: .appendText(delta, tokenCount: 1)
+              )
+            )
+          }
+
+        // Terminal text events double as a fallback for servers that send
+        // no deltas; they are skipped when this item's deltas already
+        // streamed, so the text is never doubled.
+        case "response.output_text.done":
+          if let text = event.text, !text.isEmpty,
+            !streamedTextKeys.contains(event.itemId ?? "")
+          {
+            await channel.send(
+              .response(
+                entryID: responseEntryID,
+                action: .appendText(text, tokenCount: 1)
+              )
+            )
+          }
+
+        // Refusals stream as response text; the model declined, and that is
+        // content the framework must surface, not an error to throw.
+        case "response.refusal.delta":
+          if let delta = event.delta, !delta.isEmpty {
+            streamedRefusalKeys.insert(event.itemId ?? "")
+            await channel.send(
+              .response(
+                entryID: responseEntryID,
+                action: .appendText(delta, tokenCount: 1)
+              )
+            )
+          }
+
+        case "response.refusal.done":
+          if let refusal = event.refusal ?? event.text, !refusal.isEmpty,
+            !streamedRefusalKeys.contains(event.itemId ?? "")
+          {
+            await channel.send(
+              .response(
+                entryID: responseEntryID,
+                action: .appendText(refusal, tokenCount: 1)
               )
             )
           }
@@ -319,7 +447,9 @@ public struct ResponsesLanguageModel: Sendable, LanguageModel {
         case "response.reasoning_summary_text.delta",
           "response.reasoning_text.delta",
           "response.reasoning.delta":
-          if let delta = event.delta {
+          if let delta = event.delta, !delta.isEmpty {
+            let reasoningKey = "\(event.itemId ?? "")#\(event.summaryIndex ?? 0)"
+            streamedReasoningKeys.insert(reasoningKey)
             await channel.send(
               .reasoning(
                 entryID: reasoningEntryID,
@@ -328,65 +458,96 @@ public struct ResponsesLanguageModel: Sendable, LanguageModel {
             )
           }
 
-        case "response.output_item.added":
-          if let item = event.item,
-            item.type == "function_call",
-            let outputIndex = event.outputIndex,
-            let callId = item.callId, !callId.isEmpty,
-            let name = item.name, !name.isEmpty
+        case "response.reasoning_summary_text.done", "response.reasoning_text.done":
+          if let text = event.text, !text.isEmpty,
+            !streamedReasoningKeys.contains(
+              "\(event.itemId ?? "")#\(event.summaryIndex ?? 0)"
+            )
           {
-            functionCalls[outputIndex] = (callId, name, false)
+            await channel.send(
+              .reasoning(
+                entryID: reasoningEntryID,
+                action: .appendText(text, tokenCount: 1)
+              )
+            )
+          }
+
+        case "response.output_item.added":
+          if let item = event.item, item.type == "function_call" {
+            guard let key = callKey(
+              outputIndex: event.outputIndex,
+              itemID: event.itemId ?? item.id
+            ) else { break }
+            if let callId = item.callId, !callId.isEmpty {
+              functionCalls[key]?.callId = callId
+            }
+            if let name = item.name, !name.isEmpty {
+              functionCalls[key]?.name = name
+            }
           }
 
         case "response.function_call_arguments.delta":
-          if let outputIndex = event.outputIndex,
-            let functionCall = functionCalls[outputIndex],
-            let delta = event.delta
-          {
-            await channel.send(
-              .toolCalls(
-                entryID: toolCallsEntryID,
-                action: .toolCall(
-                  id: functionCall.callId,
-                  name: functionCall.name,
-                  action: .appendArguments(delta, tokenCount: 1)
-                )
-              )
-            )
-            functionCalls[outputIndex] =
-              (functionCall.callId, functionCall.name, true)
-          }
-
-        case "response.output_item.done":
-          if let item = event.item,
-            item.type == "function_call",
-            let outputIndex = event.outputIndex
-          {
-            // Latch name/call_id here too, in case `output_item.added` was
-            // not emitted by the server.
-            if functionCalls[outputIndex] == nil,
-              let callId = item.callId, !callId.isEmpty,
-              let name = item.name, !name.isEmpty
-            {
-              functionCalls[outputIndex] = (callId, name, false)
-            }
-            // Register calls that received no argument deltas (e.g. tools
-            // with no parameters) so they still appear in the transcript.
-            if var functionCall = functionCalls[outputIndex],
-              !functionCall.registered
-            {
+          guard let key = callKey(
+            outputIndex: event.outputIndex,
+            itemID: event.itemId
+          ), let delta = event.delta, !delta.isEmpty else { break }
+          functionCalls[key]?.accumulatedArguments += delta
+          if let call = functionCalls[key] {
+            if call.registered, let callId = call.callId, let name = call.name {
               await channel.send(
                 .toolCalls(
                   entryID: toolCallsEntryID,
                   action: .toolCall(
-                    id: functionCall.callId,
-                    name: functionCall.name,
-                    action: .appendArguments("", tokenCount: 1)
+                    id: callId,
+                    name: name,
+                    action: .appendArguments(delta, tokenCount: 1)
                   )
                 )
               )
-              functionCall.registered = true
-              functionCalls[outputIndex] = functionCall
+            } else if !call.registered, let callId = call.callId, let name = call.name {
+              // Deltas streamed before the call's identity became known are
+              // covered by forwarding the accumulated arguments now.
+              await registerFunctionCall(
+                key: key, callId: callId, name: name,
+                arguments: call.accumulatedArguments
+              )
+            }
+          }
+
+        case "response.function_call_arguments.done":
+          guard let key = callKey(
+            outputIndex: event.outputIndex,
+            itemID: event.itemId
+          ), let arguments = event.arguments else { break }
+          if let name = event.name, !name.isEmpty {
+            functionCalls[key]?.name = name
+          }
+          await applyAuthoritativeArguments(key: key, arguments)
+
+        case "response.output_item.done":
+          if let item = event.item, item.type == "function_call" {
+            guard let key = callKey(
+              outputIndex: event.outputIndex,
+              itemID: event.itemId ?? item.id
+            ) else { break }
+            if let callId = item.callId, !callId.isEmpty {
+              functionCalls[key]?.callId = callId
+            }
+            if let name = item.name, !name.isEmpty {
+              functionCalls[key]?.name = name
+            }
+            if let arguments = item.arguments {
+              // The completed item carries the authoritative arguments.
+              await applyAuthoritativeArguments(key: key, arguments)
+            } else if let call = functionCalls[key], !call.registered,
+              let callId = call.callId, let name = call.name
+            {
+              // Calls with no arguments at all (no-argument tools) still
+              // register so they appear in the transcript.
+              await registerFunctionCall(
+                key: key, callId: callId, name: name,
+                arguments: call.accumulatedArguments
+              )
             }
           }
 
@@ -435,8 +596,8 @@ public struct ResponsesLanguageModel: Sendable, LanguageModel {
           )
 
         // response.created, response.in_progress, response.queued,
-        // content_part.added/done, output_text.done, reasoning_summary_*,
-        // built-in-tool events, etc. carry no data the framework needs.
+        // content_part.added/done, built-in-tool events, etc. carry no data
+        // the framework needs.
         default:
           break
         }
@@ -735,7 +896,11 @@ private struct ResponsesClient {
           let urlRequest = try buildURLRequest(for: request)
           #if canImport(Darwin)
           let (stream, response) = try await session.bytes(for: urlRequest)
-          let httpResponse = response as! HTTPURLResponse
+          guard let httpResponse = response as? HTTPURLResponse else {
+            throw ResponsesLanguageModel.RequestError.invalidRequest(
+              "Expected an HTTP response"
+            )
+          }
 
           guard httpResponse.statusCode == 200 else {
             throw ResponsesLanguageModel.RequestError.httpError(
@@ -744,16 +909,39 @@ private struct ResponsesClient {
             )
           }
 
-          for try await line in stream.lines {
-            if let event = try parseStreamLine(line) {
-              continuation.yield(event)
+          var parser = StreamParser()
+          // Split lines manually instead of `stream.lines`: AsyncLineSequence
+          // drops empty lines, and a blank line is what terminates an SSE
+          // event.
+          var lineBuffer = Data()
+          for try await byte in stream {
+            if byte == UInt8(ascii: "\n") {
+              let line = String(decoding: lineBuffer, as: UTF8.self)
+              lineBuffer.removeAll()
+              if let event = try parser.consume(line) {
+                continuation.yield(event)
+              }
+            } else {
+              lineBuffer.append(byte)
             }
+          }
+          if !lineBuffer.isEmpty,
+            let event = try parser.consume(String(decoding: lineBuffer, as: UTF8.self))
+          {
+            continuation.yield(event)
+          }
+          if let event = try parser.flush() {
+            continuation.yield(event)
           }
 
           continuation.finish()
           #else
           let (data, response) = try await session.data(for: urlRequest)
-          let httpResponse = response as! HTTPURLResponse
+          guard let httpResponse = response as? HTTPURLResponse else {
+            throw ResponsesLanguageModel.RequestError.invalidRequest(
+              "Expected an HTTP response"
+            )
+          }
 
           guard httpResponse.statusCode == 200 else {
             throw ResponsesLanguageModel.RequestError.httpError(
@@ -763,10 +951,14 @@ private struct ResponsesClient {
           }
 
           let body = String(data: data, encoding: .utf8) ?? ""
+          var parser = StreamParser()
           for line in body.split(separator: "\n", omittingEmptySubsequences: false) {
-            if let event = try parseStreamLine(String(line)) {
+            if let event = try parser.consume(String(line)) {
               continuation.yield(event)
             }
+          }
+          if let event = try parser.flush() {
+            continuation.yield(event)
           }
 
           continuation.finish()
@@ -798,35 +990,61 @@ private struct ResponsesClient {
     return urlRequest
   }
 
-  func parseStreamLine(_ line: String) throws -> StreamEvent? {
-    let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+  /// Reassembles SSE events from raw lines. A blank line terminates an
+  /// event; consecutive `data:` fields within one event join with "\n";
+  /// `event:`, `id:`, and `retry:` fields and `:` comments are ignored -
+  /// the event type is dispatched from the JSON `type` field on `data:`
+  /// payloads, so the SSE `event:` header is optional. Handles `data:` with
+  /// or without a following space and tolerates CRLF line endings.
+  struct StreamParser {
+    private var pendingDataLines: [String] = []
 
-    // Skip empty lines and comments. Non-data SSE field lines (`event:`,
-    // `id:`, `retry:`) also fall through to the final `return nil` - the
-    // event type is dispatched from the JSON `type` field on `data:` lines,
-    // so the SSE `event:` header is optional.
-    guard !trimmedLine.isEmpty, !trimmedLine.hasPrefix(":") else {
-      return nil
-    }
+    mutating func consume(_ rawLine: String) throws -> StreamEvent? {
+      var line = rawLine
+      while line.hasSuffix("\r") {
+        line.removeLast()
+      }
 
-    if trimmedLine.hasPrefix("data: ") {
-      let jsonString = String(trimmedLine.dropFirst(6))  // Remove "data: "
-
-      if jsonString.trimmingCharacters(in: .whitespaces) == "[DONE]" {
+      guard !line.isEmpty else {
+        return try dispatchPendingData()
+      }
+      guard !line.hasPrefix(":"), let colon = line.firstIndex(of: ":") else {
         return nil
       }
 
-      guard let jsonData = jsonString.data(using: .utf8) else {
-        throw ResponsesLanguageModel.RequestError.invalidStreamData
+      let field = line[line.startIndex..<colon]
+      guard field == "data" else { return nil }
+      var value = line[line.index(after: colon)...]
+      if value.hasPrefix(" ") {
+        value.removeFirst()
+      }
+      pendingDataLines.append(String(value))
+      return nil
+    }
+
+    /// Dispatches an event that was still pending when the stream ended,
+    /// for servers that omit the trailing blank line.
+    mutating func flush() throws -> StreamEvent? {
+      try dispatchPendingData()
+    }
+
+    private mutating func dispatchPendingData() throws -> StreamEvent? {
+      guard !pendingDataLines.isEmpty else { return nil }
+      let data = pendingDataLines.joined(separator: "\n")
+      pendingDataLines = []
+
+      let trimmedData = data.trimmingCharacters(in: .whitespacesAndNewlines)
+      if trimmedData.isEmpty || trimmedData.uppercased() == "[DONE]" {
+        return nil
       }
 
       let decoder = JSONDecoder()
       do {
-        return try decoder.decode(StreamEvent.self, from: jsonData)
+        return try decoder.decode(StreamEvent.self, from: Data(trimmedData.utf8))
       } catch {
         if let response = try? decoder.decode(
           ResponsesLanguageModel.ErrorResponse.self,
-          from: jsonData
+          from: Data(trimmedData.utf8)
         ) {
           throw ResponsesLanguageModel.APIError(
             message: response.error.message,
@@ -838,8 +1056,6 @@ private struct ResponsesClient {
         throw error
       }
     }
-
-    return nil
   }
 
   struct ResponseRequest: Encodable {
@@ -987,6 +1203,8 @@ private struct ResponsesClient {
     let type: String
     let delta: String?
     let text: String?
+    let refusal: String?
+    let arguments: String?
     let outputIndex: Int?
     let itemId: String?
     let item: OutputItem?
@@ -995,11 +1213,17 @@ private struct ResponsesClient {
     let message: String?
     let code: String?
     let param: String?
+    // Index of the reasoning summary part the event belongs to.
+    let summaryIndex: Int?
+    // Name echoed by some servers on terminal function-call events.
+    let name: String?
 
     private enum CodingKeys: String, CodingKey {
       case type
       case delta
       case text
+      case refusal
+      case arguments
       case outputIndex = "output_index"
       case itemId = "item_id"
       case item
@@ -1007,6 +1231,8 @@ private struct ResponsesClient {
       case message
       case code
       case param
+      case summaryIndex = "summary_index"
+      case name
     }
   }
 
@@ -1015,12 +1241,14 @@ private struct ResponsesClient {
   /// `type` alone.
   struct OutputItem: Decodable {
     let type: String?
+    let id: String?
     let callId: String?
     let name: String?
     let arguments: String?
 
     private enum CodingKeys: String, CodingKey {
       case type
+      case id
       case callId = "call_id"
       case name
       case arguments

@@ -115,6 +115,127 @@ extension ResponsesTests {
       #expect(session.transcript.responseText == "Both done")
     }
 
+    @Test func `correlates argument deltas by item_id when output_index is missing`() async throws {
+      // Some proxies omit `output_index` on delta events; correlation must
+      // fall back to `item_id`.
+      let sseData = Data(
+        [
+          #"data: {"type":"response.created","response":{"status":"in_progress","usage":null}}"#,
+          "",
+          #"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"get_weather","arguments":"","status":"in_progress"}}"#,
+          "",
+          #"data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"location\""}"#,
+          "",
+          #"data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":":\"NYC\"}"}"#,
+          "",
+          #"data: {"type":"response.completed","response":{"status":"completed","usage":null}}"#,
+          "",
+          "data: [DONE]",
+          ""
+        ].joined(separator: "\n").utf8
+      )
+
+      ResponsesMockSSEProtocol.handler = ResponsesMockSSE.toolCallThenText(
+        toolCallData: sseData,
+        textResponse: "NYC is sunny"
+      )
+
+      let session = LanguageModelSession(
+        model: makeResponsesMockModel(),
+        tools: [MockWeatherTool()]
+      )
+      let _ = try await session.respond(to: "Weather?")
+
+      let toolCallEntries = session.transcript.compactMap(\.toolCalls)
+      #expect(toolCallEntries.count == 1)
+      let calls = Array(toolCallEntries[0])
+      #expect(calls[0].toolName == "get_weather")
+      let decodedArguments = try JSONSerialization.jsonObject(
+        with: Data(calls[0].arguments.jsonString.utf8)
+      ) as? [String: String]
+      #expect(decodedArguments == ["location": "NYC"])
+    }
+
+    @Test func `repairs truncated arguments from the terminal done event`() async throws {
+      // Deltas that were lost or truncated mid-stream are replaced by the
+      // authoritative arguments carried by `function_call_arguments.done`.
+      let sseData = Data(
+        [
+          #"data: {"type":"response.created","response":{"status":"in_progress","usage":null}}"#,
+          "",
+          #"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"get_weather","arguments":"","status":"in_progress"}}"#,
+          "",
+          #"data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_1","delta":"{\"lo"}"#,
+          "",
+          #"data: {"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_1","arguments":"{\"location\":\"NYC\"}"}"#,
+          "",
+          #"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"get_weather","arguments":"{\"location\":\"NYC\"}","status":"completed"}}"#,
+          "",
+          #"data: {"type":"response.completed","response":{"status":"completed","usage":null}}"#,
+          "",
+          "data: [DONE]",
+          ""
+        ].joined(separator: "\n").utf8
+      )
+
+      ResponsesMockSSEProtocol.handler = ResponsesMockSSE.toolCallThenText(
+        toolCallData: sseData,
+        textResponse: "NYC is sunny"
+      )
+
+      let session = LanguageModelSession(
+        model: makeResponsesMockModel(),
+        tools: [MockWeatherTool()]
+      )
+      let _ = try await session.respond(to: "Weather?")
+
+      let toolCallEntries = session.transcript.compactMap(\.toolCalls)
+      #expect(toolCallEntries.count == 1)
+      let calls = Array(toolCallEntries[0])
+      #expect(calls[0].toolName == "get_weather")
+      let decodedArguments = try JSONSerialization.jsonObject(
+        with: Data(calls[0].arguments.jsonString.utf8)
+      ) as? [String: String]
+      #expect(decodedArguments == ["location": "NYC"])
+    }
+
+    @Test func `registers calls that appear only in output_item done`() async throws {
+      // Servers that skip `output_item.added` and argument deltas entirely
+      // still produce a usable tool call via the completed item.
+      let sseData = Data(
+        [
+          #"data: {"type":"response.created","response":{"status":"in_progress","usage":null}}"#,
+          "",
+          #"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"get_weather","arguments":"{\"location\":\"NYC\"}","status":"completed"}}"#,
+          "",
+          #"data: {"type":"response.completed","response":{"status":"completed","usage":null}}"#,
+          "",
+          "data: [DONE]",
+          ""
+        ].joined(separator: "\n").utf8
+      )
+
+      ResponsesMockSSEProtocol.handler = ResponsesMockSSE.toolCallThenText(
+        toolCallData: sseData,
+        textResponse: "NYC is sunny"
+      )
+
+      let session = LanguageModelSession(
+        model: makeResponsesMockModel(),
+        tools: [MockWeatherTool()]
+      )
+      let _ = try await session.respond(to: "Weather?")
+
+      let toolCallEntries = session.transcript.compactMap(\.toolCalls)
+      #expect(toolCallEntries.count == 1)
+      let calls = Array(toolCallEntries[0])
+      #expect(calls[0].toolName == "get_weather")
+      let decodedArguments = try JSONSerialization.jsonObject(
+        with: Data(calls[0].arguments.jsonString.utf8)
+      ) as? [String: String]
+      #expect(decodedArguments == ["location": "NYC"])
+    }
+
     @Test func `includes tool definitions in request`() async throws {
       ResponsesMockSSEProtocol.handler = { _ in (200, ResponsesMockSSE.text("OK")) }
 
