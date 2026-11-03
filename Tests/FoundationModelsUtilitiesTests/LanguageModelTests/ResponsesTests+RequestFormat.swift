@@ -21,6 +21,20 @@ extension ResponsesTests {
   @Suite struct RequestFormat {
     init() { ResponsesMockSSEProtocol.reset() }
 
+    struct ProbeTool: Tool {
+      let name = "probe"
+      let description = "A probe tool"
+
+      @Generable
+      struct Arguments {
+        var query: String
+      }
+
+      func call(arguments: Arguments) async throws -> String {
+        "ok"
+      }
+    }
+
     @Test func `sends model name in request body`() async throws {
       ResponsesMockSSEProtocol.handler = { _ in (200, ResponsesMockSSE.text("OK")) }
 
@@ -65,6 +79,26 @@ extension ResponsesTests {
 
       #expect(input.first?["role"] as? String == "system")
       #expect(input.last?["role"] as? String == "user")
+    }
+
+    @Test func `omits empty instructions entries from input`() async throws {
+      ResponsesMockSSEProtocol.handler = { _ in (200, ResponsesMockSSE.text("OK")) }
+
+      // A session created with tools and no instructions carries an empty
+      // instructions entry. Sending it as `content: []` is rejected with a
+      // 400 by strict servers (for example, Volcano Engine Ark).
+      let session = LanguageModelSession(
+        model: makeResponsesMockModel(),
+        tools: [ProbeTool()]
+      )
+      let _ = try await session.respond(to: "test")
+
+      let body = try responsesRequestBody()
+      let input = try #require(body["input"] as? [[String: Any]])
+      #expect(!input.contains { item in
+        (item["role"] as? String) == "system"
+          && ((item["content"] as? [[String: Any]])?.isEmpty ?? false)
+      })
     }
 
     @Test func `encodes single-segment message content as a string`() async throws {

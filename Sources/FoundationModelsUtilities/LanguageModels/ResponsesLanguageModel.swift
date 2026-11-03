@@ -533,6 +533,13 @@ public struct ResponsesLanguageModel: Sendable, LanguageModel {
                 )
               )
               #endif
+            case .data:
+              throw LanguageModelError.unsupportedTranscriptContent(
+                LanguageModelError.UnsupportedTranscriptContent(
+                  unsupportedContent: [entry],
+                  debugDescription: "Data attachments are not supported by \(Self.self)"
+                )
+              )
             @unknown default:
               throw LanguageModelError.unsupportedTranscriptContent(
                 LanguageModelError.UnsupportedTranscriptContent(
@@ -541,13 +548,6 @@ public struct ResponsesLanguageModel: Sendable, LanguageModel {
                 )
               )
             }
-          case .custom:
-            throw LanguageModelError.unsupportedTranscriptContent(
-              LanguageModelError.UnsupportedTranscriptContent(
-                unsupportedContent: [entry],
-                debugDescription: "Custom segments are not supported by \(Self.self)"
-              )
-            )
 
           @unknown default:
             throw LanguageModelError.unsupportedTranscriptContent(
@@ -583,13 +583,30 @@ public struct ResponsesLanguageModel: Sendable, LanguageModel {
             pieces.append(text.content)
           case .structure(let structure):
             pieces.append(structure.content.jsonString)
-          case .attachment, .custom:
+          case .attachment:
             continue
           @unknown default:
             continue
           }
         }
         return pieces.joined()
+      }
+
+      // Reports whether a converted message carries no transmittable
+      // content. Empty instructions entries (for example, when a session
+      // enables tools without providing instructions) would otherwise be
+      // sent as `content: []`, which strict servers reject.
+      func isEffectivelyEmpty(
+        _ content: ResponsesClient.MessageContent
+      ) -> Bool {
+        switch content {
+        case .text(let text):
+          return text.isEmpty
+        case .parts(let parts):
+          return parts.allSatisfy { part in
+            (part.text ?? "").isEmpty && part.imageURL == nil
+          }
+        }
       }
 
       var items: [ResponsesClient.InputItem] = []
@@ -602,30 +619,36 @@ public struct ResponsesLanguageModel: Sendable, LanguageModel {
         switch entry {
         case .instructions(let instructions):
           // Instructions become system-role message items.
-          items.append(
-            ResponsesClient.InputItem(
-              type: "message",
-              role: "system",
-              content: try convertedContent(
-                instructions.segments,
-                in: entry,
-                textPartType: "input_text"
+          let content = try convertedContent(
+            instructions.segments,
+            in: entry,
+            textPartType: "input_text"
+          )
+          if !isEffectivelyEmpty(content) {
+            items.append(
+              ResponsesClient.InputItem(
+                type: "message",
+                role: "system",
+                content: content
               )
             )
-          )
+          }
 
         case .prompt(let prompt):
-          items.append(
-            ResponsesClient.InputItem(
-              type: "message",
-              role: "user",
-              content: try convertedContent(
-                prompt.segments,
-                in: entry,
-                textPartType: "input_text"
+          let content = try convertedContent(
+            prompt.segments,
+            in: entry,
+            textPartType: "input_text"
+          )
+          if !isEffectivelyEmpty(content) {
+            items.append(
+              ResponsesClient.InputItem(
+                type: "message",
+                role: "user",
+                content: content
               )
             )
-          )
+          }
 
         case .toolCalls(let toolCalls):
           // Each tool call becomes a `function_call` input item. The
@@ -652,17 +675,20 @@ public struct ResponsesLanguageModel: Sendable, LanguageModel {
           )
 
         case .response(let response):
-          items.append(
-            ResponsesClient.InputItem(
-              type: "message",
-              role: "assistant",
-              content: try convertedContent(
-                response.segments,
-                in: entry,
-                textPartType: "output_text"
+          let content = try convertedContent(
+            response.segments,
+            in: entry,
+            textPartType: "output_text"
+          )
+          if !isEffectivelyEmpty(content) {
+            items.append(
+              ResponsesClient.InputItem(
+                type: "message",
+                role: "assistant",
+                content: content
               )
             )
-          )
+          }
 
         case .reasoning(let reasoning):
           // Replay reasoning as a summary-only `reasoning` item. The framework
@@ -678,6 +704,12 @@ public struct ResponsesLanguageModel: Sendable, LanguageModel {
               summary: [ResponsesClient.SummaryPart(text: text)]
             )
           )
+
+        case .data:
+          // Data entries carry custom binary payloads. This model does not
+          // declare support for any data entry types, so skip them on replay
+          // the same way unknown entry kinds are skipped.
+          continue
 
         @unknown default:
           continue
