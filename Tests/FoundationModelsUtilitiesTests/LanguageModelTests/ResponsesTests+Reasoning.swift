@@ -165,5 +165,29 @@ extension ResponsesTests {
         }.joined() ?? ""
       #expect(reasoningText == "Pondering")
     }
+
+    @Test func `sends reasoning effort and summary when configured`() async throws {
+      ResponsesMockSSEProtocol.handler = { _ in (200, ResponsesMockSSE.text("OK")) }
+
+      var model = makeResponsesMockModel()
+      model.reasoningEffort = "high"
+      let session = LanguageModelSession(model: model)
+      let _ = try await session.respond(to: "test")
+
+      let body = try responsesRequestBody()
+      let reasoning = try #require(body["reasoning"] as? [String: Any])
+      #expect(reasoning["effort"] as? String == "high")
+      #expect(reasoning["summary"] as? String == "auto")
+    }
+
+    @Test func `omits reasoning when no effort is configured`() async throws {
+      ResponsesMockSSEProtocol.handler = { _ in (200, ResponsesMockSSE.text("OK")) }
+
+      let session = LanguageModelSession(model: makeResponsesMockModel())
+      let _ = try await session.respond(to: "test")
+
+      let body = try responsesRequestBody()
+      #expect(body["reasoning"] == nil)
+    }
   }
 }

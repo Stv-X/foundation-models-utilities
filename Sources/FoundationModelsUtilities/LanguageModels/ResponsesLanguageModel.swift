@@ -59,6 +59,13 @@ public struct ResponsesLanguageModel: Sendable, LanguageModel {
 
   public var supportsGuidedGeneration: Bool
 
+  /// The reasoning effort sent as `reasoning.effort` in each request (for
+  /// example, `"low"`, `"medium"`, or `"high"`). When `nil`, the field is
+  /// omitted and the endpoint's default applies. When set, reasoning
+  /// summaries are requested alongside it (`summary: "auto"`) so the model's
+  /// reasoning streams into the transcript.
+  public var reasoningEffort: String?
+
   // Overridden in tests to inject a URLSession with mock protocol handlers.
   var urlSession: URLSession?
 
@@ -70,6 +77,10 @@ public struct ResponsesLanguageModel: Sendable, LanguageModel {
   ///   - url: The base URL of the responses endpoint.
   ///   - additionalHeaders: Headers to merge on top of the defaults (for
   ///     example, an `Authorization` header).
+  ///   - reasoningEffort: The reasoning effort sent as `reasoning.effort` in
+  ///     each request. When set, reasoning summaries are also requested so
+  ///     the model's reasoning streams into the transcript. Defaults to
+  ///     `nil`, which leaves the endpoint's default in place.
   ///   - supportsGuidedGeneration: Whether the endpoint supports the
   ///     `text.format` JSON Schema field for structured output. Defaults to
   ///     `true`.
@@ -81,12 +92,14 @@ public struct ResponsesLanguageModel: Sendable, LanguageModel {
     name: String,
     url: URL,
     additionalHeaders: [String: String] = [:],
+    reasoningEffort: String? = nil,
     supportsGuidedGeneration: Bool = true,
     urlSessionConfiguration: URLSessionConfiguration? = nil
   ) {
     self.name = name
     self.url = url
     self.additionalHeaders = additionalHeaders
+    self.reasoningEffort = reasoningEffort
     self.supportsGuidedGeneration = supportsGuidedGeneration
     self.urlSession = urlSessionConfiguration.map { URLSession(configuration: $0) }
   }
@@ -105,6 +118,7 @@ public struct ResponsesLanguageModel: Sendable, LanguageModel {
       modelName: name,
       url: url,
       additionalHeaders: additionalHeaders,
+      reasoningEffort: reasoningEffort,
       urlSession: urlSession
     )
   }
@@ -203,18 +217,21 @@ public struct ResponsesLanguageModel: Sendable, LanguageModel {
       fileprivate let modelName: String
       fileprivate let url: URL
       fileprivate let additionalHeaders: [String: String]
+      fileprivate let reasoningEffort: String?
       fileprivate let urlSession: URLSession?
 
       public static func == (lhs: Configuration, rhs: Configuration) -> Bool {
         lhs.modelName == rhs.modelName
           && lhs.url == rhs.url
           && lhs.additionalHeaders == rhs.additionalHeaders
+          && lhs.reasoningEffort == rhs.reasoningEffort
       }
 
       public func hash(into hasher: inout Hasher) {
         hasher.combine(modelName)
         hasher.combine(url)
         hasher.combine(additionalHeaders)
+        hasher.combine(reasoningEffort)
       }
     }
 
@@ -272,6 +289,9 @@ public struct ResponsesLanguageModel: Sendable, LanguageModel {
               schema: schema
             )
           )
+        },
+        reasoning: configuration.reasoningEffort.map {
+          ResponsesClient.ReasoningConfig(effort: $0)
         }
       )
 
@@ -541,14 +561,6 @@ public struct ResponsesLanguageModel: Sendable, LanguageModel {
                 )
               )
             }
-          case .custom:
-            throw LanguageModelError.unsupportedTranscriptContent(
-              LanguageModelError.UnsupportedTranscriptContent(
-                unsupportedContent: [entry],
-                debugDescription: "Custom segments are not supported by \(Self.self)"
-              )
-            )
-
           @unknown default:
             throw LanguageModelError.unsupportedTranscriptContent(
               LanguageModelError.UnsupportedTranscriptContent(
@@ -583,7 +595,7 @@ public struct ResponsesLanguageModel: Sendable, LanguageModel {
             pieces.append(text.content)
           case .structure(let structure):
             pieces.append(structure.content.jsonString)
-          case .attachment, .custom:
+          case .attachment:
             continue
           @unknown default:
             continue
@@ -834,6 +846,7 @@ private struct ResponsesClient {
     var tools: [Tool]
     var toolChoice: ToolChoice
     var text: TextConfig?
+    var reasoning: ReasoningConfig?
     var stream = true
     // Stateless: replay the full transcript as `input` every turn and never
     // reference `previous_response_id`, so don't accumulate stored responses.
@@ -848,6 +861,7 @@ private struct ResponsesClient {
       case tools
       case toolChoice = "tool_choice"
       case text
+      case reasoning
       case stream
       case store
     }
@@ -946,6 +960,11 @@ private struct ResponsesClient {
       var schema: GenerationSchema
       var strict = true
     }
+  }
+
+  struct ReasoningConfig: Encodable {
+    var effort: String
+    var summary: String = "auto"
   }
 
   /// A single decoded SSE event. All fields except `type` are optional; the
