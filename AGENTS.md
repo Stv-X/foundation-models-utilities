@@ -15,7 +15,7 @@ Fork of `apple/foundation-models-utilities`: upstream lands via merges of `apple
 
 Upstream commits are titled "Update to accompany Xcode <version> beta N" because the Foundation Models API surface shifts with every beta. `has no member` / `switch must be exhaustive` errors usually mean your Xcode doesn't match the SDK the code targets. Don't rewrite public-API usage to satisfy an older SDK; check the newest "Update to accompany…" commit and the API in your installed SDK first.
 
-Known state (2026-11-03, only Xcode installed = 27.2 / 27B52): `main` no longer built on 27.2 — `ResponsesLanguageModel.swift` used the removed `Transcript.Segment.custom`, and 27.2 added `Transcript.Entry.data` / `AttachmentSegment.Content.data`. Migrated in the working tree on 2026-11-03 (see that file); until it is committed/merged upstream, expect the same skew to return after the next `apple:main` merge. `swift build` on 27.2 must stay green.
+Known state (2026-11-03): `main` builds on Xcode 27.2 as of commit `7be2542` — `Transcript.Segment.custom` was removed and `.data` cases are handled. Future "Update to accompany…" merges can reintroduce skew; `swift build` on 27.2 must stay green.
 
 ## Conventions
 
